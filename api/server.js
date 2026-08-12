@@ -100,7 +100,8 @@ app.get('/api/patients/search', async (req, res) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      'SELECT * FROM patients WHERE last_name = ?',
+      'SELECT id, first_name, last_name, email, diagnosis, created_at ' +
+      'FROM patients WHERE last_name = ? LIMIT 100',
       [lastName]
     );
     res.json({ count: rows.length, lastName, data: rows });
@@ -128,11 +129,15 @@ app.post('/api/hospitals/:id/admit', async (req, res) => {
       [hospitalId]
     );
 
-    // Notify the external regional bed registry of the new count before we
-    // commit (simulated here with a network round-trip latency).
+    await conn.commit();
+    conn.release();
+    conn = null; // prevent a double-release in the finally block below
+
+    // Notify the external regional bed registry after the write is durable
+    // AND after the connection is back in the pool — this call touches no
+    // DB resource, so it should never hold one hostage.
     await notifyBedRegistry(hospitalId);
 
-    await conn.commit();
     res.json({ status: 'admitted', hospitalId });
   } catch (err) {
     if (conn) {
@@ -153,12 +158,41 @@ function notifyBedRegistry(_hospitalId) {
 // ---------------------------------------------------------------------------
 // Full patient export for the analytics/ETL team.
 // ---------------------------------------------------------------------------
-app.get('/api/patients/export', async (_req, res) => {
+app.get('/api/patients/export', async (req, res) => {
+  const pool = getPool();
+  let conn;
   try {
-    const pool = getPool();
-    const [rows] = await pool.query('SELECT * FROM patients');
-    res.json({ count: rows.length, data: rows });
+    conn = await pool.getConnection();
+    res.setHeader('Content-Type', 'application/json');
+    res.write('{"data":[');
+
+    let first = true;
+    const queryStream = conn.connection.query('SELECT * FROM patients').stream();
+
+  queryStream.on('data', (row) => {
+  if (!first) res.write(',');
+  first = false;
+  const canContinue = res.write(JSON.stringify(row));
+  if (!canContinue) {
+    queryStream.pause();
+    res.once('drain', () => queryStream.resume());
+  }
+});
+
+    queryStream.on('end', () => {
+      res.write(']}');
+      res.end();
+      conn.release();
+    });
+
+    queryStream.on('error', (err) => {
+      dbErrorsTotal.inc({ route: '/api/patients/export', code: err.code || 'UNKNOWN' });
+      if (!res.headersSent) res.status(500);
+      res.end();
+      conn.release();
+    });
   } catch (err) {
+    if (conn) conn.release();
     dbErrorsTotal.inc({ route: '/api/patients/export', code: err.code || 'UNKNOWN' });
     res.status(500).json({ error: err.code || 'ERROR', message: err.message });
   }
