@@ -1,0 +1,66 @@
+<svg width="680" height="420" viewBox="0 0 680 420" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>How the OPS-2203 row lock queue forms</title>
+<desc>One transaction holds an exclusive lock on the hospitals table row while it waits 500ms for an external call, and 17 other transactions queue behind it waiting for the same row.</desc>
+<style>
+  .th { font: 600 14px system-ui, -apple-system, sans-serif; fill: #1a1a1a; }
+  .ts { font: 400 12px system-ui, -apple-system, sans-serif; fill: #444; }
+  .c-gray rect { fill: #e9e9ec; stroke: #b8b8c0; }
+  .c-red rect { fill: #fbdcdc; stroke: #d64545; }
+  .c-teal { fill: #1f9e8e; }
+  .c-coral { fill: #e8785a; }
+  .arr { stroke: #666; stroke-width: 1.5; fill: none; }
+</style>
+<rect width="680" height="420" fill="#ffffff"/>
+
+<g class="node c-gray">
+<rect x="230" y="40" width="220" height="44" rx="8" stroke-width="1"/>
+<text class="th" x="340" y="62" text-anchor="middle" dominant-baseline="central">hospitals row id=1</text>
+</g>
+
+<line x1="340" y1="84" x2="340" y2="144" class="arr" marker-end="url(#arrow)"/>
+<text class="ts" x="360" y="118">UPDATE claims the lock</text>
+
+<g class="node c-red">
+<rect x="200" y="144" width="280" height="56" rx="8" stroke-width="1"/>
+<text class="th" x="340" y="164" text-anchor="middle" dominant-baseline="central">Transaction A</text>
+<text class="ts" x="340" y="182" text-anchor="middle" dominant-baseline="central">UPDATE, then notify (500ms)</text>
+</g>
+
+<rect x="200" y="212" width="24" height="18" rx="3" class="c-teal"/>
+<rect x="224" y="212" width="256" height="18" rx="3" class="c-coral"/>
+
+<line x1="340" y1="234" x2="340" y2="272" class="arr" marker-end="url(#arrow)"/>
+<text class="ts" x="360" y="257">17 transactions wait for this lock</text>
+
+<g class="node c-gray">
+<rect x="48" y="276" width="135" height="44" rx="8" stroke-width="1"/>
+<text class="th" x="115" y="298" text-anchor="middle" dominant-baseline="central">Transaction B</text>
+</g>
+<g class="node c-gray">
+<rect x="198" y="276" width="135" height="44" rx="8" stroke-width="1"/>
+<text class="th" x="265" y="298" text-anchor="middle" dominant-baseline="central">Transaction C</text>
+</g>
+<g class="node c-gray">
+<rect x="348" y="276" width="135" height="44" rx="8" stroke-width="1"/>
+<text class="th" x="415" y="298" text-anchor="middle" dominant-baseline="central">Transaction D</text>
+</g>
+<g class="node c-gray">
+<rect x="498" y="276" width="135" height="44" rx="8" stroke-width="1"/>
+<text class="th" x="565" y="298" text-anchor="middle" dominant-baseline="central">+ 14 more</text>
+</g>
+
+<rect x="220" y="342" width="12" height="12" rx="2" class="c-teal"/>
+<text class="ts" x="238" y="352">Fast: the actual database write</text>
+
+<rect x="220" y="362" width="12" height="12" rx="2" class="c-coral"/>
+<text class="ts" x="238" y="372">Slow: notify call runs inside the lock</text>
+
+<rect x="220" y="382" width="12" height="12" rx="2" class="c-gray-fill" fill="#e9e9ec" stroke="#b8b8c0" stroke-width="1"/>
+<text class="ts" x="238" y="392">Waiting: blocked until Transaction A commits</text>
+
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#666" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+</svg>

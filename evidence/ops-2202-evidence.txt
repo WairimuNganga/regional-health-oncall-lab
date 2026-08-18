@@ -1,0 +1,139 @@
+=====================================================================
+OPS-2202 — Whole app freezes, DB looks idle
+Command: k6 run load-tests/reproduce-OPS-2202.js (ramp 0->2000 VUs / 30s, GET /api/patients/recent)
+=====================================================================
+
+--- k6, BEFORE any fix (connectionLimit: 2, queueLimit: 0) ---
+  █ THRESHOLDS
+    http_req_failed
+    ✓ 'rate<0.05' rate=0.00%
+
+  █ TOTAL RESULTS
+    checks_total.......: 23450   734.255496/s
+    checks_succeeded...: 100.00% 23450 out of 23450
+    checks_failed......: 0.00%   0 out of 23450
+
+    HTTP
+    http_req_duration..............: avg=2.43s min=40.05ms med=2.32s max=11.99s p(90)=2.92s p(95)=3.86s
+    http_req_failed................: 0.00%  0 out of 23450
+    http_reqs......................: 23450  734.255496/s
+
+    vus............................: 117    min=117        max=2000
+    vus_max........................: 2000   min=2000       max=2000
+
+    NETWORK
+    data_received..................: 431 MB 14 MB/s
+    data_sent......................: 2.1 MB 65 kB/s
+
+running (31.9s), 0000/2000 VUs, 23450 complete and 0 interrupted iterations
+
+--- MySQL connections, sampled every 1s for 35s during the SAME run ---
+Threads_connected 3   (flat for all 35 samples — never moved despite 2000 VUs)
+
+--- capacity-api container stats, sampled during the same run ---
+Before load: CPU 0.5-16.7%, MEM ~33MB
+During load: CPU 139-196%,  MEM 47-105MB   (sustained ~16-17s)
+After load:  CPU back to ~0.5%, MEM settling to ~42MB
+
+=====================================================================
+FIX ATTEMPT 1 — connectionLimit: 2 -> 20 (sized via Little's Law: L = lambda*W ~ 11-15, doubled for headroom)
+=====================================================================
+
+--- MySQL connections during load, AFTER raising the pool ---
+Threads_connected: flat at 3 for ~10 samples (before load), then jumps to 21 (=20+1 client) and stays flat
+for the remaining ~24 samples once load starts.
+
+--- k6, AFTER connectionLimit=20 (queueLimit still 0/unbounded) ---
+WARN[0035] Request Failed  error="Get \"http://localhost:3000/api/patients/recent\": read tcp 127.0.0.1:65251->127.0.0.1:3000: read: connection reset by peer"
+
+  █ THRESHOLDS
+    http_req_failed
+    ✗ 'rate<0.05' rate=2.63%
+
+  █ TOTAL RESULTS
+    checks_total.......: 30831   880.393348/s
+    checks_succeeded...: 97.36%  30019 out of 30831
+    checks_failed......: 2.63%   812 out of 30831
+
+    HTTP
+    http_req_duration..............: avg=1.84s min=8.09ms med=896.79ms max=29.91s p(90)=1.88s p(95)=13.23s
+      { expected_response:true }...: avg=1.49s min=8.09ms med=877.88ms max=29.91s p(90)=1.82s p(95)=4.36s
+    http_req_failed................: 2.63%  812 out of 30831
+    http_reqs......................: 30831  880.393348/s
+
+    vus............................: 25     min=25           max=2000
+    vus_max........................: 2000   min=2000         max=2000
+
+    NETWORK
+    data_received..................: 552 MB 16 MB/s
+    data_sent......................: 2.7 MB 78 kB/s
+
+running (35.0s), 0000/2000 VUs, 30831 complete and 15 interrupted iterations
+
+Result: median and min improved a lot, but p95/max got WORSE (queueLimit: 0 = unbounded queueing still
+lets a subset of requests wait 10-30s instead of failing fast).
+
+=====================================================================
+FIX ATTEMPT 2 — queueLimit: 0 -> 50 (bounded, fast failure)
+=====================================================================
+
+--- MySQL connections during load, AFTER bounding the queue ---
+Threads_connected: 1 for ~11 samples (before load), jumps to 21 and stays flat for ~20 samples during load,
+drops to 4 then 3 as load drains.
+
+--- capacity-api container stats during the same run ---
+Before load: CPU 0.4-4.9%,  MEM ~38-39MB
+During load: CPU 87-153%,   MEM 52-65MB   (sustained ~14s)
+After load:  CPU back to <1%, MEM settling to ~35MB
+
+--- k6, AFTER connectionLimit=20 + queueLimit=50 ---
+  █ THRESHOLDS
+    http_req_failed
+    ✗ 'rate<0.05' rate=86.86%
+
+  █ TOTAL RESULTS
+    checks_total.......: 64733   1848.727098/s
+    checks_succeeded...: 13.13%  8502 out of 64733
+    checks_failed......: 86.86%  56231 out of 64733
+
+    HTTP
+    http_req_duration..............: avg=903.75ms min=8.38ms med=98.85ms  max=29.17s p(90)=419.83ms p(95)=2.68s
+      { expected_response:true }...: avg=1.86s    min=8.38ms med=204.48ms max=29.17s p(90)=875.82ms p(95)=25.96s
+    http_req_failed................: 86.86% 56231 out of 64733
+    http_reqs......................: 64733  1848.727098/s
+
+    vus............................: 82     min=82             max=2000
+    vus_max........................: 2000   min=2000           max=2000
+
+    NETWORK
+    data_received..................: 173 MB 4.9 MB/s
+    data_sent......................: 5.8 MB 165 kB/s
+
+running (35.0s), 0000/2000 VUs, 64733 complete and 26 interrupted iterations
+
+--- Diagnosing whether failures were clean rejections or silent network drops ---
+$ docker compose logs capacity-api --since 3m | grep -iE "queue|limit|error" | wc -l
+0
+(explained: the route's catch block only increments a Prometheus counter, never console.logs per-request errors)
+
+$ curl -s 'http://localhost:9090/api/v1/query?query=sum(db_errors_total)'
+{
+    "status": "success",
+    "data": {"resultType": "vector", "result": [{"metric": {}, "value": [1786562095.459, "54044"]}]}
+}
+=> 54,044 cumulative db errors on a freshly-rebuilt container closely tracks k6's 56,231 failed checks,
+   confirming these are clean, intended pool-queue rejections, not silent network-level drops.
+
+=====================================================================
+RESULT SUMMARY — successful throughput actually DROPPED under this attempt (retry-storm effect)
+=====================================================================
+                          | Attempt 1 (pool=20, unbounded queue) | Attempt 2 (pool=20, queueLimit=50)
+Successful requests       | 30,019                                | 8,502
+Successful rate           | ~858/s                                 | ~243/s
+Error rate                | 2.63%                                  | 86.86% (mostly clean, fast rejections)
+Median (successful)       | 896.79ms                               | 204.48ms
+
+Explanation: k6 script has no backoff — a rejected VU immediately retries in a tight loop. Once rejections
+became fast (~100ms) instead of hanging (10-30s), total http_reqs roughly doubled (30,831 -> 64,733) without
+a corresponding rise in genuine successful throughput — a self-inflicted retry storm against a system still
+genuinely over capacity. The fix (bounded queue) is correct; full benefit needs client-side backoff too.

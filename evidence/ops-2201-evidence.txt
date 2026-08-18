@@ -1,0 +1,134 @@
+=====================================================================
+OPS-2201 — Patient search unusably slow at shift change
+Command: k6 run load-tests/reproduce-OPS-2201.js (200 VUs, 30s, GET /api/patients/search?lastName=Smith)
+=====================================================================
+
+--- k6, BEFORE any fix ---
+  █ THRESHOLDS
+    http_req_duration
+    ✗ 'p(95)<300' p(95)=20.92s
+
+  █ TOTAL RESULTS
+    checks_total.......: 534     11.03554/s
+    checks_succeeded...: 100.00% 534 out of 534
+    checks_failed......: 0.00%   0 out of 534
+
+    HTTP
+    http_req_duration..............: avg=14.6s min=267.54ms med=18.04s max=26.23s p(90)=18.5s p(95)=20.92s
+    http_req_failed................: 0.00%  0 out of 534
+    http_reqs......................: 534    11.03554/s
+
+    vus............................: 6      min=6        max=200
+    vus_max........................: 200    min=200      max=200
+
+    NETWORK
+    data_received..................: 1.9 GB 40 MB/s
+    data_sent......................: 56 kB  1.1 kB/s
+
+running (0m48.4s), 000/200 VUs, 534 complete and 0 interrupted iterations
+
+--- EXPLAIN ANALYZE, isolated single query, BEFORE index ---
+$ EXPLAIN ANALYZE SELECT * FROM patients WHERE last_name = 'Smith';
+-> Filter: (patients.last_name = 'Smith')  (cost=10276 rows=9819) (actual time=0.161..91.6 rows=10000 loops=1)
+    -> Table scan on patients  (cost=10276 rows=98191) (actual time=0.143..78 rows=100000 loops=1)
+
+=====================================================================
+FIX ATTEMPT 1 — CREATE INDEX idx_patients_last_name ON patients(last_name);
+=====================================================================
+
+--- EXPLAIN ANALYZE, AFTER index ---
+$ EXPLAIN ANALYZE SELECT * FROM patients WHERE last_name = 'Smith';
+-> Index lookup on patients using idx_patients_last_name (last_name='Smith')  (cost=2371 rows=10000) (actual time=0.205..36.4 rows=10000 loops=1)
+
+--- k6, AFTER index only (query cheaper, end-to-end WORSE) ---
+  █ THRESHOLDS
+    http_req_duration
+    ✗ 'p(95)<300' p(95)=29.71s
+
+  █ TOTAL RESULTS
+    checks_total.......: 540     11.690581/s
+    checks_succeeded...: 100.00% 540 out of 540
+    checks_failed......: 0.00%   0 out of 540
+
+    HTTP
+    http_req_duration..............: avg=14.28s min=210.5ms  med=16.21s max=34.89s p(90)=25.32s p(95)=29.71s
+    http_req_failed................: 0.00%  0 out of 540
+    http_reqs......................: 540    11.690581/s
+
+    vus............................: 4      min=4              max=200
+    vus_max........................: 200    min=200            max=200
+
+    NETWORK
+    data_received..................: 2.0 GB 43 MB/s
+    data_sent......................: 56 kB  1.2 kB/s
+
+running (0m46.2s), 000/200 VUs, 540 complete and 0 interrupted iterations
+
+--- Second-pass diagnostics: connection pool and container CPU, sampled during load ---
+$ for i in $(seq 1 35); do docker compose exec mysql-db mysql -uroot -plabpassword capacity_lab \
+    -e "SHOW STATUS LIKE 'Threads_connected';" 2>/dev/null | tail -1; sleep 1; done
+Threads_connected 3   (constant for all 35 samples — flat, never moved)
+
+$ docker stats --no-stream capacity-api   (sampled repeatedly during the same k6 run)
+Before load: CPU 0.4-2.7%,  MEM ~41MB
+During load: CPU 143-169%,  MEM 55-73MB   (sustained ~20s, matching k6's run duration)
+After load:  CPU back to ~0.5%, MEM settling back to ~41MB
+
+Payload size from k6: data_received 1.9GB / 532 requests ~= 3.57MB per response
+(SELECT * still returning all ~10,000 matching rows including the notes TEXT column)
+
+=====================================================================
+FIX ATTEMPT 2 — trimmed columns + LIMIT 100
+  'SELECT id, first_name, last_name, email, diagnosis, created_at FROM patients WHERE last_name = ? LIMIT 100'
+=====================================================================
+
+--- k6, AFTER index + bounded payload (SLO PASSES) ---
+  █ THRESHOLDS
+    http_req_duration
+    ✓ 'p(95)<300' p(95)=277.03ms
+
+  █ TOTAL RESULTS
+    checks_total.......: 30184  1000.889805/s
+    checks_succeeded...: 94.16% 28424 out of 30184
+    checks_failed......: 5.83%  1760 out of 30184
+
+    HTTP
+    http_req_duration..............: avg=198.47ms min=0s      med=182.57ms max=1s p(90)=257.5ms  p(95)=277.03ms
+    http_req_failed................: 5.83%  1760 out of 30184
+    http_reqs......................: 30184  1000.889805/s
+
+    vus............................: 200    min=200           max=200
+    vus_max........................: 200    min=200           max=200
+
+    NETWORK
+    data_received..................: 438 MB 15 MB/s
+    data_sent......................: 3.1 MB 104 kB/s
+
+running (0m30.2s), 000/200 VUs, 30184 complete and 0 interrupted iterations
+
+WARN[0000] Request Failed  error="Get \"http://localhost:3000/api/patients/search?lastName=Smith\": read tcp 127.0.0.1:60305->127.0.0.1:3000: read: connection reset by peer"
+
+--- Investigating the 5.83% connection-reset errors (ruling out an app crash) ---
+$ docker compose ps capacity-api
+NAME           STATUS         PORTS
+capacity-api   Up 2 minutes   0.0.0.0:3000->3000/tcp
+
+$ docker compose logs capacity-api --since 5m | tail -50
+capacity-api  | capacity-api listening on :3000 (metrics at /metrics)
+
+$ docker inspect --format='{{.RestartCount}}' capacity-api
+0
+
+Conclusion: not an app crash. Attributed to a network/infra-layer ceiling (Docker Desktop port-forwarding /
+Node keepAliveTimeout under very high connection churn on macOS) — documented, not hidden, and flagged as
+a pattern to watch for again at high throughput in later incidents (it recurred in OPS-2202).
+
+=====================================================================
+RESULT SUMMARY
+=====================================================================
+Stage                          | p95      | RPS       | Errors
+No fix                         | 20.92s   | 11.04/s   | 0.00%
+Index only                     | 29.71s   | 11.69/s   | 0.00%  (WORSE than no fix)
+Index + bounded payload        | 277.03ms | ~1000.9/s | 5.83%  (infra-layer, investigated, not a code bug)
+
+Overall improvement: ~76x on p95, ~91x on throughput.

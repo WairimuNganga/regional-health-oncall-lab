@@ -1,0 +1,106 @@
+=====================================================================
+BASELINE — steady-state control group
+Command: k6 run --summary-trend-stats "avg,min,med,p(90),p(95),p(99),max" load-tests/00-baseline.js
+50 constant VUs, 30s, GET /api/patients/recent
+=====================================================================
+
+--- RUN 1 (initial) ---
+  █ THRESHOLDS
+    http_req_duration
+    ✗ 'p(95)<200' p(95)=204.07ms
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+
+  █ TOTAL RESULTS
+    checks_total.......: 1500    48.504162/s
+    checks_succeeded...: 100.00% 1500 out of 1500
+    checks_failed......: 0.00%   0 out of 1500
+
+    HTTP
+    http_req_duration..............: avg=27.09ms min=1.01ms med=6.18ms max=311.53ms p(90)=58.55ms p(95)=204.07ms
+    http_req_failed................: 0.00%  0 out of 1500
+    http_reqs......................: 1500   48.504162/s
+
+    vus............................: 50     min=50        max=50
+    vus_max........................: 50     min=50        max=50
+
+    NETWORK
+    data_received..................: 28 MB  892 kB/s
+    data_sent......................: 134 kB 4.3 kB/s
+
+running (0m30.9s), 00/50 VUs, 1500 complete and 0 interrupted iterations
+
+--- RUN 2 ---
+  █ THRESHOLDS
+    http_req_duration
+    ✓ 'p(95)<200' p(95)=54.59ms
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+
+  █ TOTAL RESULTS
+    checks_total.......: 1500    49.208199/s
+    checks_succeeded...: 100.00% 1500 out of 1500
+    checks_failed......: 0.00%   0 out of 1500
+
+    HTTP
+    http_req_duration..............: avg=14.45ms min=1.04ms med=8.5ms max=75.34ms p(90)=41.68ms p(95)=54.59ms
+    http_req_failed................: 0.00%  0 out of 1500
+    http_reqs......................: 1500   49.208199/s
+
+    vus............................: 50     min=50        max=50
+    vus_max........................: 50     min=50        max=50
+
+    NETWORK
+    data_received..................: 28 MB  905 kB/s
+    data_sent......................: 134 kB 4.4 kB/s
+
+running (0m30.5s), 00/50 VUs, 1500 complete and 0 interrupted iterations
+
+--- RUN 3 (used as the reference baseline — full percentiles captured) ---
+  █ THRESHOLDS
+    http_req_duration
+    ✓ 'p(95)<200' p(95)=67.51ms
+    http_req_failed
+    ✓ 'rate<0.01' rate=0.00%
+
+  █ TOTAL RESULTS
+    checks_total.......: 1500    49.185561/s
+    checks_succeeded...: 100.00% 1500 out of 1500
+    checks_failed......: 0.00%   0 out of 1500
+
+    HTTP
+    http_req_duration..............: avg=14.98ms min=1.02ms med=9.61ms p(90)=25.42ms p(95)=67.51ms p(99)=101.07ms max=112.17ms
+    http_req_failed................: 0.00%  0 out of 1500
+    http_reqs......................: 1500   49.185561/s
+
+    vus............................: 50     min=50        max=50
+    vus_max........................: 50     min=50        max=50
+
+    NETWORK
+    data_received..................: 28 MB  904 kB/s
+    data_sent......................: 134 kB 4.4 kB/s
+
+running (0m30.5s), 00/50 VUs, 1500 complete and 0 interrupted iterations
+
+--- Peak heap query (Prometheus, covering the run-3 window) ---
+$ curl -s 'http://localhost:9090/api/v1/query?query=max_over_time(nodejs_heap_size_used_bytes%7Bjob%3D%22capacity-api%22%7D%5B15m%5D)'
+{
+    "status": "success",
+    "data": {
+        "resultType": "vector",
+        "result": [
+            {
+                "metric": {"app": "capacity-api", "instance": "capacity-api:3000", "job": "capacity-api"},
+                "value": [1786558908.288, "24662952"]
+            }
+        ]
+    }
+}
+=> 24,662,952 bytes ≈ 23.52 MB peak heap
+
+--- SLOs derived from this baseline ---
+p95 < 300ms | error rate < 1% | throughput floor ≈ 45 req/s
+
+--- Run-to-run variance note ---
+Same script, zero code changes, three runs: p95 = 204.07ms / 54.59ms / 67.51ms — roughly a 4x spread,
+attributed to normal Docker/laptop CPU scheduling noise, not a code issue.

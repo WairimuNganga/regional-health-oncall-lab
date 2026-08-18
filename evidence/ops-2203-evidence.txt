@@ -1,0 +1,165 @@
+=====================================================================
+OPS-2203 — Bed admissions fail under mass-casualty load
+Command: k6 run load-tests/reproduce-OPS-2203.js (500 VUs, 30s, POST /api/hospitals/1/admit)
+NOTE: connectionLimit=20 / queueLimit=50 from the OPS-2202 fix were still active for this incident.
+=====================================================================
+
+--- k6, BEFORE any fix ---
+  █ THRESHOLDS
+    http_req_duration
+    ✓ 'p(95)<1000' p(95)=166.14ms
+    http_req_failed
+    ✗ 'rate<0.05' rate=99.91%
+
+  █ TOTAL RESULTS
+    checks_total.......: 99398   1939.423862/s
+    checks_succeeded...: 0.08%   82 out of 99398
+    checks_failed......: 99.91%  99316 out of 99398
+
+    HTTP
+    http_req_duration..............: avg=158.27ms min=889µs    med=96.01ms max=46.07s p(90)=149.57ms p(95)=166.14ms
+      { expected_response:true }...: avg=19.14s   min=743.68ms med=20.35s  max=46.07s p(90)=29.88s   p(95)=36.85s
+    http_req_failed................: 99.91% 99316 out of 99398
+    http_reqs......................: 99398  1939.423862/s
+
+    vus............................: 1      min=1              max=500
+    vus_max........................: 500    min=500            max=500
+
+    NETWORK
+    data_received..................: 30 MB  590 kB/s
+    data_sent......................: 14 MB  281 kB/s
+
+running (0m51.3s), 000/500 VUs, 99398 complete and 0 interrupted iterations
+
+--- Direct lock evidence, performance_schema.data_locks, captured MID-RUN ---
+$ SELECT * FROM performance_schema.data_locks\G
+*** row 1 ***  txn 47201  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: GRANTED  LOCK_DATA: 1
+*** row 21 ***  txn 47203  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 22 ***  txn 47205  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 23 ***  txn 47207  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 24 ***  txn 47209  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 25 ***  txn 47210  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 26 ***  txn 47211  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 27 ***  txn 47212  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 28 ***  txn 47213  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 29 ***  txn 47214  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 30 ***  txn 47215  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 31 ***  txn 47216  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 32 ***  txn 47217  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 33 ***  txn 47218  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 34 ***  txn 47219  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 35 ***  txn 47221  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 36 ***  txn 47223  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 37 ***  txn 47225  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+*** row 38 ***  txn 47227  hospitals  PRIMARY  LOCK_MODE: X,REC_NOT_GAP  LOCK_STATUS: WAITING  LOCK_DATA: 1
+=> 1 transaction GRANTED, 17 transactions WAITING on the identical row (id=1), same instant.
+
+--- SHOW ENGINE INNODB STATUS, TRANSACTIONS section, same moment ---
+---TRANSACTION 47229, ACTIVE 1 sec starting index read
+mysql tables in use 1, locked 1
+LOCK WAIT 2 lock struct(s), heap size 1128, 1 row lock(s)
+MySQL thread id 1003, query id 99152 172.19.0.4 root updating
+UPDATE hospitals SET available_beds = available_beds - 1 WHERE id = 1
+------- TRX HAS BEEN WAITING 1 SEC FOR THIS LOCK TO BE GRANTED:
+RECORD LOCKS space id 7 page no 4 n bits 72 index PRIMARY of table `capacity_lab`.`hospitals` trx id 47229
+lock_mode X locks rec but not gap waiting
+ 3: len 16; hex 47656e6572616c20486f73706974616c; asc General Hospital;;
+------------------
+---TRANSACTION 47227, ACTIVE 2 sec starting index read
+LOCK WAIT 2 lock struct(s), heap size 1128, 1 row lock(s)
+UPDATE hospitals SET available_beds = available_beds - 1 WHERE id = 1
+------- TRX HAS BEEN WAITING 2 SEC FOR THIS LOCK TO BE GRANTED:
+
+=====================================================================
+FIX ATTEMPT 1 — move notifyBedRegistry() to AFTER conn.commit()
+=====================================================================
+
+--- Lock view snapshot AFTER this fix, mid-run (waiters dropped 17 -> 8) ---
+1 GRANTED (txn 47573), 8 transactions WAITING on the same hospitals row id=1 (txns 47575, 47577, 47579,
+47581, 47583, 47585, 47587, 47589, 47590, 47592 — subset shown, 8 in WAITING status at this snapshot)
+
+--- Verifying the running code matched the edit (ruling out a stale build) ---
+$ docker compose exec capacity-api sed -n '113,151p' server.js
+[confirmed: conn.commit(); await notifyBedRegistry(hospitalId); — commit genuinely runs first]
+
+--- k6, AFTER attempt 1 ---
+WARN[0000] Request Failed  error="read tcp 127.0.0.1:52717->127.0.0.1:3000: read: connection reset by peer"
+  █ THRESHOLDS
+    http_req_duration
+    ✓ 'p(95)<1000' p(95)=169.04ms
+    http_req_failed
+    ✗ 'rate<0.05' rate=99.70%
+
+  █ TOTAL RESULTS
+    checks_succeeded...: 0.29%  277 out of 93183
+    checks_failed......: 99.70% 92906 out of 93183
+
+    HTTP
+      { expected_response:true }...: avg=7.96s min=771.43ms med=6.56s max=18.52s p(90)=16.52s p(95)=17.13s
+    http_reqs......................: 93183  2893.935283/s
+
+running (35.0s), 000/500 VUs, 93183 complete and 0 interrupted iterations
+
+Successful throughput ~1.6/s -> ~8.6/s. Improvement, but far short of the "hundreds/sec" theoretically
+expected if the row lock alone were the constraint. Second mechanism found: conn.release() in the finally
+block only runs AFTER notifyBedRegistry() resolves — the connection itself was still held 500ms.
+
+=====================================================================
+FIX ATTEMPT 2 — also release the connection before notifying (conn.release(); conn = null;)
+=====================================================================
+
+--- Verifying the code again ---
+$ docker compose exec capacity-api sed -n '113,151p' server.js
+[confirmed: conn.commit(); conn.release(); conn = null; await notifyBedRegistry(hospitalId);]
+
+--- Lock view snapshot AFTER attempt 2, mid-run (back up to 8 waiters on a fresh burst) ---
+1 GRANTED (txn 48163), 8 transactions WAITING on hospitals row id=1 (txns 48165, 48167, 48169, 48171,
+48173, 48175, 48177, 48179 — likely an early-test-window burst as all connections open near-simultaneously)
+
+--- k6, AFTER attempt 2 (throughput did NOT jump as predicted) ---
+  █ THRESHOLDS
+    http_req_duration
+    ✓ 'p(95)<1000' p(95)=178.8ms
+    http_req_failed
+    ✗ 'rate<0.05' rate=99.68%
+
+  █ TOTAL RESULTS
+    checks_succeeded...: 0.31%  289 out of 91036
+    checks_failed......: 99.68% 90747 out of 91036
+
+    HTTP
+      { expected_response:true }...: avg=14.51s min=745.74ms med=11.42s max=30.63s p(90)=30.57s p(95)=30.59s
+    http_reqs......................: 91036  2960.769608/s
+
+running (0m30.7s), 000/500 VUs, 91036 complete and 0 interrupted iterations
+
+Successful throughput ~8.6/s -> ~8.1/s (essentially flat), median got WORSE (6.56s -> 11.42s).
+Code confirmed correct, logs clean — needed aggregate evidence, not another snapshot, to explain this.
+
+--- Aggregate MySQL lock statistics, reset immediately before this run ---
+$ mysql -e "FLUSH STATUS;"
+$ k6 run load-tests/reproduce-OPS-2203.js
+$ mysql -e "SHOW GLOBAL STATUS LIKE 'Innodb_row_lock%';"
++-------------------------------+---------+
+| Variable_name                 | Value   |
++-------------------------------+---------+
+| Innodb_row_lock_current_waits | 17      |
+| Innodb_row_lock_time          | 1918209 |
+| Innodb_row_lock_time_avg      | 2336    |
+| Innodb_row_lock_time_max      | 6021    |
+| Innodb_row_lock_waits         | 821     |
++-------------------------------+---------+
+
+=====================================================================
+RESULT SUMMARY — real, but bounded by physics: one row, one writer at a time
+=====================================================================
+                            | Before  | Attempt 1 (commit before notify) | Attempt 2 (+release early)
+Successful throughput        | ~1.6/s  | ~8.6/s                            | ~8.1/s
+Median (successful)          | 20.35s  | 6.56s                             | 11.42s (worse)
+Row-lock waits (this run)    | n/a     | not separately measured           | 821 waits, avg 2,336ms, max 6,021ms
+
+Conclusion: hospitals row id=1 can only ever be modified by one transaction at a time. Both fixes are
+correct and worth keeping (removed real, unnecessary latency), but the remaining ~8/s ceiling is
+structural — a single hot row's contention limit, not a bug fixable further inside this transaction.
+Real fix for the ticket's full mass-casualty scenario needs an architectural change (queue, sharded
+counters, or eventual consistency) outside the scope of this transaction.

@@ -1,0 +1,137 @@
+=====================================================================
+OPS-2204 — Nightly export crashes the service
+Command: k6 run load-tests/reproduce-OPS-2204.js (50 VUs, 2min, GET /api/patients/export)
+Container capped at 160MB; NODE_OPTIONS: --max-old-space-size=256 (deliberate mismatch per docker-compose.yml)
+=====================================================================
+
+--- k6, BEFORE any fix ---
+  █ THRESHOLDS
+    http_req_failed
+    ✗ 'rate<0.05' rate=100.00%
+
+  █ TOTAL RESULTS
+    checks_total.......: 43457   332.474412/s
+    checks_succeeded...: 0.00%   0 out of 43457
+    checks_failed......: 100.00% 43457 out of 43457
+
+    HTTP
+    http_req_duration....: avg=137.69ms min=0s med=606µs max=15s p(90)=12.79ms p(95)=23.03ms
+    http_req_failed......: 100.00% 43457 out of 43457
+    http_reqs............: 43457   332.474412/s
+
+    vus..................: 6       min=6              max=50
+    vus_max..............: 50      min=50             max=50
+
+    NETWORK
+    data_received........: 0 B     0 B/s
+    data_sent............: 2.0 MB  15 kB/s
+
+running (2m10.7s), 00/50 VUs, 43457 complete and 0 interrupted iterations
+
+--- Memory trace, sampled every 1s for 130s during load, BEFORE any fix (condensed) ---
+Idle:        ~33MB
+Under load:  153MB -> 159.8MB -> 160MiB (limit) within ~12-13s
+Then:        repeated drops to 0B/0B, PIDS 0 (crash) -- at least 9 distinct crash-and-restart cycles
+             visible across the 130s sample window, each followed by a brief recovery to ~15-25MB
+             before climbing and crashing again.
+(Full second-by-second docker stats output for this run available on request / in chat history —
+condensed here to the pattern since the raw dump is several hundred lines.)
+
+--- Crash confirmation, BEFORE any fix ---
+$ docker inspect --format='{{.RestartCount}}' capacity-api
+11
+
+$ docker compose logs capacity-api --since 5m | grep -iE "exit|killed|FATAL|restart|memory"
+(no output — silent, consistent with a kernel cgroup OOM SIGKILL, which gives Node no chance to log)
+
+=====================================================================
+FIX ATTEMPT 1 — stream rows to the response instead of buffering the full result set
+=====================================================================
+
+--- Memory trace, AFTER attempt 1 (condensed) ---
+Idle:        ~22-25MB
+Under load:  climbs to 159-160MiB repeatedly, drops to 0B/0B (crash), recovers to ~15-25MB, repeats
+             -- 6+ visible crash cycles across the 130s window (down from 9+, real but partial improvement)
+
+--- k6, AFTER attempt 1 ---
+  █ THRESHOLDS
+    http_req_failed
+    ✗ 'rate<0.05' rate=100.00%
+
+  █ TOTAL RESULTS
+    checks_succeeded...: 0.00%   0 out of 30869
+    checks_failed......: 100.00% 30869 out of 30869
+    data_received........: 43 MB   333 kB/s   (first time ANY data was delivered before failing)
+    http_reqs............: 30869   241.525296/s
+
+running (2m07.8s), 00/50 VUs, 30869 complete and 0 interrupted iterations
+
+--- Crash diagnostics, AFTER attempt 1 ---
+$ docker inspect --format='{{.State.OOMKilled}}' capacity-api
+false     <- a DIFFERENT failure mechanism than before (was consistent with kernel OOM pre-fix)
+
+$ docker inspect --format='{{.RestartCount}}' capacity-api
+14        (was 11 before this fix -- only 3 NEW restarts during this entire 2-minute test)
+
+$ docker compose exec capacity-api sed -n '153,185p' server.js
+[confirmed: streaming code correctly deployed, matches the intended fix]
+
+$ docker compose logs capacity-api --since 5m | grep -iE "heap|FATAL|Allocation failed|error"
+(no output)
+
+Leading theory: res.write()'s return value was never checked. When it returns false (internal write
+buffer full), unsent JSON chunks still accumulate in memory per in-flight request -- the accumulation
+point moved from "one giant array" to "Node's internal write buffer," not eliminated.
+
+=====================================================================
+FIX ATTEMPT 2 — respect backpressure: pause()/resume() on res.write() + 'drain'
+=====================================================================
+
+--- Memory trace, AFTER attempt 2 (condensed — full resolution) ---
+Idle:        ~24-27MB
+Under load:  climbs to a peak of ~110MB, then PLATEAUS and stabilizes around 89-90MB for the entire
+             remainder of the test -- never approaches 160MB again, never drops to 0B/0B (no crash)
+
+--- k6, AFTER attempt 2 ---
+  █ THRESHOLDS
+    http_req_failed
+    ✓ 'rate<0.05' rate=0.00%
+
+  █ TOTAL RESULTS
+    checks_succeeded...: 100.00% 117 out of 117
+    checks_failed......: 0.00%   0 out of 117
+
+    HTTP
+    http_req_duration..............: avg=51.07s min=12.42s med=51.59s max=1m50s p(90)=1m24s p(95)=1m40s
+    http_req_failed................: 0.00%  0 out of 117
+    http_reqs......................: 117    0.778366/s
+
+    vus............................: 26     min=26       max=50
+    vus_max........................: 50     min=50       max=50
+
+    NETWORK
+    data_received..................: 4.8 GB 32 MB/s
+    data_sent......................: 13 kB  85 B/s
+
+running (2m30.3s), 00/50 VUs, 117 complete and 26 interrupted iterations (graceful stop mid-export)
+
+--- Crash diagnostics, AFTER attempt 2 (final confirmation) ---
+$ docker inspect --format='{{.RestartCount}}' capacity-api
+0
+
+$ docker inspect --format='{{.State.OOMKilled}}' capacity-api
+false
+
+=====================================================================
+RESULT SUMMARY
+=====================================================================
+                       | Before          | Attempt 1 (stream only) | Attempt 2 (+ backpressure)
+checks_succeeded       | 0/43,457 (0%)   | 0/30,869 (0%)            | 117/117 (100%)
+Restarts this run       | 11 (cumulative) | +3 new                   | +0 new
+Peak memory             | 160MiB (crash)  | 159-160MiB (crash)       | ~110MB, settles ~90MB
+Data delivered           | 0 B             | 43 MB (then failed)      | 4.8 GB (all completed)
+Median response          | 606µs (fast-fail)| n/a (still failing)     | 51.59s (slow but succeeding)
+
+Full resolution confirmed by two independent signals: RestartCount 0, OOMKilled false, plus 100% success
+across 117 completed exports under sustained 50-VU load that crashed the container within 12-13 seconds
+before either fix was applied.
